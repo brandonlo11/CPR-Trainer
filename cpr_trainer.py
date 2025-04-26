@@ -25,6 +25,12 @@ WARNING_COLOR                = (50, 50, 255)
 CHEST_TARGET_RADIUS      = 15
 HAND_PLACEMENT_TOLERANCE = 45     # px
 COMPRESSION_THRESHOLD    = 8      # wrist Δ-y to count a comp.
+MAX_IDLE_TIME            = 2.5    # seconds before prompting to continue
+SUMMARY_DISPLAY_DURATION = 5.0    # seconds to show summary
+RATE_STD_DEV_STEADY_MAX  = 0.08   # sec std dev threshold for 'Steady' rate
+RATE_STD_DEV_FAIR_MAX    = 0.15   # sec std dev threshold for 'Fair' rate
+DRIFT_COUNT_GOOD_MAX     = 50     # drift frames threshold for 'Good' placement
+DRIFT_COUNT_FAIR_MAX     = 150    # drift frames threshold for 'Fair' placement
 
 # ─── Supine-detection parameters ────────────────────────
 SUPINE_MIN_DEG            = 60    # ≥ this angle ⇒ lying flat
@@ -73,6 +79,17 @@ last_rescuer_hand_y = None
 is_compressing      = False
 compressions_remaining = 30  # Start with 30 compressions per cycle
 cpr_cycle_active     = False # Flag to indicate if we are in a compression cycle
+
+# Cycle-specific metrics
+cycle_compression_times = []    # Timestamps for current cycle's compressions
+cycle_hand_drifts       = 0     # Counter for frames hands were off-target this cycle
+last_compression_time   = None  # Timestamp of the last detected compression
+
+# UI State for prompts/summary
+show_summary               = False
+summary_display_start_time = None
+summary_text_lines         = []
+idle_prompt_active         = False
 
 hand_placement_feedback = "Looking for Victim/Hands"
 hands_centered          = False
@@ -130,7 +147,12 @@ while cap.isOpened():
     rgb.flags.writeable = True
     image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-    # ─── Per-frame resets ───────────────────────────────
+    # --- Handle Summary Display Timeout ---
+    if show_summary and (time.time() - summary_display_start_time > SUMMARY_DISPLAY_DURATION):
+        show_summary = False
+        summary_text_lines = [] # Clear summary text
+
+    # ─── Per-frame resets / UI State Updates ──────────────────
     victim_chest_target = None
     rescuer_hand_center = None
     hand_placement_feedback = "Looking for Victim/Hands"
@@ -139,6 +161,19 @@ while cap.isOpened():
     victim_supine           = False
     hands_detected_this_frame = False
 
+    # --- Check for Idle Time & Hand Drifts during Active Cycle ---
+    current_time = time.time()
+    if cpr_cycle_active and not show_summary:
+        # Idle check
+        if last_compression_time and (current_time - last_compression_time > MAX_IDLE_TIME):
+            idle_prompt_active = True
+        # else: # Implicitly reset by compression event
+        #     idle_prompt_active = False
+
+        # Hand drift check (only count if hands are actually detected)
+        if hands_detected_this_frame and not hands_centered:
+            cycle_hand_drifts += 1
+
     # ─── Pose: chest target & supine check ───────────────
     if pose_results.pose_landmarks:
         lms = pose_results.pose_landmarks.landmark
@@ -146,12 +181,21 @@ while cap.isOpened():
 
         ls = get_landmark_coords(lms, mp_pose.PoseLandmark.LEFT_SHOULDER,  w, h)
         rs = get_landmark_coords(lms, mp_pose.PoseLandmark.RIGHT_SHOULDER, w, h)
-        if ls[0] and rs[0]:
+
+        # Determine chest target based on visible shoulders
+        if ls[0] and rs[0]:  # Both shoulders visible - Best case: Midpoint
             victim_chest_target = ((ls[0] + rs[0]) // 2, (ls[1] + rs[1]) // 2)
-            hand_placement_feedback = "Show Rescuer Hands"
-        else:
+            hand_placement_feedback = "Target: Mid-Shoulder"
+        elif ls[0]: # Only left shoulder visible - Fallback: Use Left Shoulder
+            victim_chest_target = ls
+            hand_placement_feedback = "Target: Left Shoulder (Approx)"
+        elif rs[0]: # Only right shoulder visible - Fallback: Use Right Shoulder
+            victim_chest_target = rs
+            hand_placement_feedback = "Target: Right Shoulder (Approx)"
+        else: # Neither shoulder visible
+            # victim_chest_target remains None
             hand_placement_feedback = "Show Victim Chest Area"
-    else:
+    else: # No pose landmarks detected
         hand_placement_feedback = "Cannot find Victim"
 
     # ─── NEW hand-placement logic ────────────────────────
@@ -196,22 +240,66 @@ while cap.isOpened():
             elif dy < -COMPRESSION_THRESHOLD and is_compressing:
                 is_compressing = False
                 now = time.time()
+                # Update rate calculation list (for immediate feedback)
                 compression_times.append(now)
                 compression_times = compression_times[-20:]
 
-                # Start or continue the cycle and decrement counter
-                if not cpr_cycle_active:
-                    cpr_cycle_active = True
+                # Update cycle metrics if active
                 if cpr_cycle_active:
+                    last_compression_time = now # Update last compression time
+                    idle_prompt_active = False    # Reset idle prompt on compression
+                    cycle_compression_times.append(now)
                     compressions_remaining -= 1
-                    if compressions_remaining <= 0:
-                        print("Cycle complete. Resetting compressions.") # Placeholder for breath prompt later
-                        compressions_remaining = 30
-                        # Optionally reset rate calculation here too?
-                        # compression_times.clear()
-                        # current_rate = 0
-                        # cpr_cycle_active = False # Keep active until reset or breath phase
 
+                    if compressions_remaining <= 0:
+                        print("Cycle complete.")
+                        # --- Calculate cycle summary ---
+                        avg_rate = 0
+                        rate_consistency = "N/A"
+                        if len(cycle_compression_times) > 1:
+                            cycle_duration = cycle_compression_times[-1] - cycle_compression_times[0]
+                            avg_rate = (len(cycle_compression_times) - 1) / cycle_duration * 60 if cycle_duration > 0.1 else 0
+
+                            intervals = np.diff(cycle_compression_times)
+                            if len(intervals) > 1:
+                                rate_std_dev = np.std(intervals)
+                                if rate_std_dev <= RATE_STD_DEV_STEADY_MAX:
+                                    rate_consistency = "Steady"
+                                elif rate_std_dev <= RATE_STD_DEV_FAIR_MAX:
+                                    rate_consistency = "Fair"
+                                else:
+                                    rate_consistency = "Uneven"
+                            else:
+                                rate_consistency = "N/A (Not enough data)"
+
+                        placement_consistency = "N/A"
+                        if cycle_hand_drifts == 0:
+                            placement_consistency = "Excellent"
+                        elif cycle_hand_drifts <= DRIFT_COUNT_GOOD_MAX:
+                            placement_consistency = "Good"
+                        elif cycle_hand_drifts <= DRIFT_COUNT_FAIR_MAX:
+                            placement_consistency = "Fair"
+                        else:
+                            placement_consistency = "Needs Improvement"
+
+                        summary_text_lines = [
+                            "--- Cycle Summary ---",
+                            f"Avg Rate: {avg_rate:.0f} /min",
+                            f"Rate Consistency: {rate_consistency}",
+                            f"Placement: {placement_consistency}"
+                        ]
+                        # --- End Calculate cycle summary ---
+
+                        show_summary = True
+                        summary_display_start_time = time.time()
+
+                        # Reset for next cycle
+                        compressions_remaining = 30
+                        cycle_compression_times = []
+                        cycle_hand_drifts = 0
+                        # Keep cpr_cycle_active = True, user might start next cycle
+
+                # Update overall rate calculation (rolling window)
                 if len(compression_times) > 1:
                     dt = compression_times[-1] - compression_times[0]
                     current_rate = ((len(compression_times) - 1) / dt * 60
@@ -262,11 +350,23 @@ while cap.isOpened():
     cv2.putText(image, TARGET_DEPTH_MSG, (10, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, FEEDBACK_COLOR_ERR, 2)
 
-    # Display Compression Count during active cycle
-    if cpr_cycle_active:
+    # Display Compression Count during active cycle OR Summary OR Idle Prompt
+    text_y_pos = 180 # Starting Y position for dynamic messages
+
+    if show_summary:
+        for i, line in enumerate(summary_text_lines):
+            cv2.putText(image, line, (10, text_y_pos + i * 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, INFO_COLOR, 2)
+        text_y_pos += len(summary_text_lines) * 30 # Adjust for next potential text
+    elif idle_prompt_active:
+         cv2.putText(image, "Continue Compressions!", (10, text_y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, WARNING_COLOR, 2)
+         text_y_pos += 30 # Adjust for next potential text
+    elif cpr_cycle_active: # Only show count if not showing summary or idle prompt
         comp_text = f"Compressions Left: {compressions_remaining}"
-        cv2.putText(image, comp_text, (10, 180), # Position below depth message
+        cv2.putText(image, comp_text, (10, text_y_pos),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, INFO_COLOR, 2)
+        text_y_pos += 30 # Adjust for next potential text
 
     if time.time() - last_metronome_time >= metronome_interval:
         metronome_on = not metronome_on
@@ -275,7 +375,7 @@ while cap.isOpened():
     cv2.circle(image, (w - 50, 50), 20, metro_col, -1)
 
     cv2.putText(image,
-        "TRAINING AID ONLY – cannot measure depth – not for real emergencies",
+        "TRAINING AID ONLY",
         (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WARNING_COLOR, 2)
 
     cv2.imshow('CPR Trainer – Proof of Concept', image)
@@ -293,6 +393,15 @@ while cap.isOpened():
         print("State reset.")
         compressions_remaining = 30 # Reset compression count
         cpr_cycle_active     = False # Reset cycle flag
+        # Reset cycle metrics
+        cycle_compression_times = []
+        cycle_hand_drifts       = 0
+        last_compression_time   = None
+        # Reset UI state
+        show_summary            = False
+        summary_display_start_time = None
+        summary_text_lines      = []
+        idle_prompt_active      = False
 
 # ───────────────── Cleanup ──────────────────────────────
 pose.close()
