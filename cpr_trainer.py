@@ -2,254 +2,256 @@ import cv2
 import mediapipe as mp
 import time
 import numpy as np
-import math  # For distance & angle calculations
+import math
+import csv
 
 # ──────────────────── Configuration ────────────────────
-TARGET_RATE_MIN = 100
-TARGET_RATE_MAX = 120
-TARGET_DEPTH_MSG = "Depth: Push hard (5-6 cm)"   # Cannot measure, only remind
+TARGET_RATE_MIN  = 100
+TARGET_RATE_MAX  = 120
+TARGET_DEPTH_MSG = "Depth: Push hard (5-6 cm)"
 
 # Colours
-CHEST_TARGET_COLOR_CENTERED = (0, 255, 0)     # Green
-CHEST_TARGET_COLOR_OFF       = (0, 165, 255)  # Orange
-AR_ARROW_COLOR               = (255, 255, 0)  # Cyan-yellow arrow
-METRONOME_COLOR_ON           = (255, 255, 255)
-METRONOME_COLOR_OFF          = (100, 100, 100)
-FEEDBACK_COLOR_GOOD          = (0, 255, 0)
-FEEDBACK_COLOR_WARN          = (0, 165, 255)
-FEEDBACK_COLOR_ERR           = (0, 0, 255)
-INFO_COLOR                   = (255, 255, 0)
-WARNING_COLOR                = (50, 50, 255)
+CHEST_TARGET_COLOR_CENTERED = (0, 255, 0)
+CHEST_TARGET_COLOR_OFF      = (0, 165, 255)
+AR_ARROW_COLOR              = (255, 255, 0)
+METRONOME_COLOR_ON          = (255, 255, 255)
+METRONOME_COLOR_OFF         = (100, 100, 100)
+FEEDBACK_COLOR_GOOD         = (0, 255, 0)
+FEEDBACK_COLOR_WARN         = (0, 165, 255)
+FEEDBACK_COLOR_ERR          = (0,   0, 255)
+INFO_COLOR                  = (255, 255, 0)
+WARNING_COLOR               = (50,  50, 255)
 
 # Visual parameters
 CHEST_TARGET_RADIUS      = 15
-HAND_PLACEMENT_TOLERANCE = 45     # px
-COMPRESSION_THRESHOLD    = 8      # wrist Δ-y threshold
-MAX_IDLE_TIME            = 2.5
-SUMMARY_DISPLAY_DURATION = 5.0
-RATE_STD_DEV_STEADY_MAX  = 0.08
-RATE_STD_DEV_FAIR_MAX    = 0.15
-DRIFT_COUNT_GOOD_MAX     = 50
-DRIFT_COUNT_FAIR_MAX     = 150
+HAND_PLACEMENT_TOLERANCE = 45          # px
+COMPRESSION_THRESHOLD    = 8           # Δ-y for one compression
 
-# Supine detection
-SUPINE_MIN_DEG  = 60
+# Supine status messages
 SUPINE_STATUS_OK_MSG   = "Victim supine ✓"
 SUPINE_STATUS_WARN_MSG = "Victim NOT lying flat!"
 
 # ───────────────── MediaPipe init ───────────────────────
-mp_drawing         = mp.solutions.drawing_utils
-mp_pose            = mp.solutions.pose
-mp_hands           = mp.solutions.hands
-mp_drawing_styles  = mp.solutions.drawing_styles
+mp_drawing        = mp.solutions.drawing_utils
+mp_pose           = mp.solutions.pose
+mp_hands          = mp.solutions.hands
+mp_styles         = mp.solutions.drawing_styles
 
-pose = mp_pose.Pose(static_image_mode=False, model_complexity=1,
-                    min_detection_confidence=0.5, min_tracking_confidence=0.5)
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2,
-                       model_complexity=1, min_detection_confidence=0.5,
+pose  = mp_pose.Pose(model_complexity=1,
+                     min_detection_confidence=0.5,
+                     min_tracking_confidence=0.5)
+hands = mp_hands.Hands(max_num_hands=2,
+                       model_complexity=1,
+                       min_detection_confidence=0.5,
                        min_tracking_confidence=0.5)
 
 # ───────────────── Video capture ───────────────────────
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
-    print("Error: Could not open video capture device.")
-    exit()
+    raise RuntimeError("Could not open webcam")
 
-# ───────────────── State variables ─────────────────────
-instruction_step = 0
-instructions = [
-    "1. CHECK responsiveness & breathing.",
-    "2. CALL Emergency Services (e.g., 911).",
-    "3. Place heel of hand on centre of chest.",
-    "4. Ensure rescuer hands are centred.",
-    "5. Start compressions (Rate: 100-120/min).",
-    "6. Push hard and fast. Allow chest recoil."
-]
-
+# ───────────────── State vars ──────────────────────────
 compression_times = []
 current_rate      = 0
-last_rescuer_hand_y = None
-is_compressing      = False
-compressions_remaining = 30
-cpr_cycle_active     = False
+last_hand_y       = None
+is_compressing    = False
+metronome_interval = 60 / ((TARGET_RATE_MIN + TARGET_RATE_MAX) / 2)
+last_metronome_time = time.time()
+metronome_on        = False
 
-cycle_compression_times = []
-cycle_hand_drifts       = 0
-last_compression_time   = None
-
-show_summary               = False
-summary_display_start_time = None
-summary_text_lines         = []
-idle_prompt_active         = False
-
-metronome_interval   = 60.0 / ((TARGET_RATE_MIN + TARGET_RATE_MAX) / 2)
-last_metronome_time  = time.time()
-metronome_on         = False
-
-# ───────────────── Helper functions ─────────────────────
-def get_landmark_coords(landmarks, idx_enum, w, h):
+# ───────────────── Helper functions ────────────────────
+def get_xy(lms, idx, w, h):
     try:
-        idx = idx_enum.value if hasattr(idx_enum, 'value') else idx_enum
-        lm  = landmarks[idx]
-        if getattr(lm, "visibility", 1.0) > 0.5:
-            return int(lm.x * w), int(lm.y * h)
-    except (IndexError, AttributeError):
-        pass
+        pt = lms[idx.value]
+        if getattr(pt, "visibility", 1.0) > .5:
+            return int(pt.x * w), int(pt.y * h)
+    except: pass
     return None, None
 
-def calculate_distance(p1, p2):
-    if None in (*p1, *p2): return float('inf')
-    return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
+def distance(p, q):
+    return math.hypot(p[0] - q[0], p[1] - q[1]) if None not in (*p, *q) else 1e9
 
-def is_victim_supine(lms, w, h):
-    ls = get_landmark_coords(lms, mp_pose.PoseLandmark.LEFT_SHOULDER,  w, h)
-    rs = get_landmark_coords(lms, mp_pose.PoseLandmark.RIGHT_SHOULDER, w, h)
-    lh = get_landmark_coords(lms, mp_pose.PoseLandmark.LEFT_HIP,       w, h)
-    rh = get_landmark_coords(lms, mp_pose.PoseLandmark.RIGHT_HIP,      w, h)
-    if None in (*ls,*rs,*lh,*rh): return False
-    sh_mid  = ((ls[0]+rs[0])//2, (ls[1]+rs[1])//2)
-    hip_mid = ((lh[0]+rh[0])//2, (lh[1]+rh[1])//2)
-    angle = abs(math.degrees(math.atan2(hip_mid[0]-sh_mid[0],
-                                        hip_mid[1]-sh_mid[1])))
-    return angle >= SUPINE_MIN_DEG
+def victim_supine(lms, w, h):
+    ls, rs = get_xy(lms, mp_pose.PoseLandmark.LEFT_SHOULDER,  w, h), \
+             get_xy(lms, mp_pose.PoseLandmark.RIGHT_SHOULDER, w, h)
+    lh, rh = get_xy(lms, mp_pose.PoseLandmark.LEFT_HIP,      w, h), \
+             get_xy(lms, mp_pose.PoseLandmark.RIGHT_HIP,     w, h)
+    if None in (*ls, *rs, *lh, *rh): return False
+    vec = ((lh[0]+rh[0])//2 - (ls[0]+rs[0])//2,
+           (lh[1]+rh[1])//2 - (ls[1]+rs[1])//2)
+    ang = abs(math.degrees(math.atan2(vec[1], vec[0])))
+    return ang <= 30 or ang >= 60          # horizontal OR vertical torso
 
-# ─── AR: draw arrow and hint when hands off-target ─────
-def draw_ar_guidance(frame, target, hand, centered):
-    if target and hand and not centered:
-        cv2.arrowedLine(frame, hand, target, AR_ARROW_COLOR, 3, tipLength=0.25)
-        cv2.putText(frame, "Move hands here",
-                    (target[0]+10, target[1]-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, AR_ARROW_COLOR, 2)
+def angle_between(v1, v2):
+    num = np.dot(v1, v2)
+    den = np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6
+    return math.degrees(math.acos(max(-1, min(1, num / den))))
+
+def elbow_angle(lms, side, w, h):
+    sh = get_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER"), w, h)
+    el = get_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_ELBOW"),    w, h)
+    wr = get_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_WRIST"),    w, h)
+    if None in (*sh, *el, *wr): return None
+    v1, v2 = (sh[0]-el[0], sh[1]-el[1]), (wr[0]-el[0], wr[1]-el[1])
+    return angle_between(v1, v2)
+
+def draw_labels(img, victim_pt, resc_pt):
+    if victim_pt:
+        cv2.circle(img, victim_pt, 24, (255,255,255), 2)
+        cv2.putText(img, "Victim", (victim_pt[0]-30, victim_pt[1]-30),
+                    cv2.FONT_HERSHEY_SIMPLEX, .6, (255,255,255), 2)
+    if resc_pt:
+        cv2.circle(img, resc_pt, 24, (255,0,255), 2)
+        cv2.putText(img, "Rescuer", (resc_pt[0]-35, resc_pt[1]-30),
+                    cv2.FONT_HERSHEY_SIMPLEX, .6, (255,0,255), 2)
 
 # ──────────────────── Main loop ─────────────────────────
-print("Starting CPR Trainer…  (press q to quit)")
+print("CPR Trainer – press ‘q’ to quit")
 while cap.isOpened():
-    ok, frame = cap.read()
-    if not ok: continue
+    success, frame = cap.read()
+    if not success: break
     h, w, _ = frame.shape
     frame = cv2.flip(frame, 1)
-    rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # --- detect pose & hands ---
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     rgb.flags.writeable = False
-    pose_res  = pose.process(rgb)
+    pose_res = pose.process(rgb)
     hands_res = hands.process(rgb)
     rgb.flags.writeable = True
     frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-    # Summary timeout
-    if show_summary and time.time()-summary_display_start_time > SUMMARY_DISPLAY_DURATION:
-        show_summary = False; summary_text_lines = []
+    victim_center = resc_hand_pt = None
+    hand_msg = "Looking for Victim/Hands"
+    posture_msg = "Posture: Unclear"
+    posture_ok  = False
+    hands_centered = False
+    target_col = CHEST_TARGET_COLOR_OFF
+    supine_ok  = False
 
-    # per-frame vars
-    victim_chest_target = None
-    rescuer_hand_center = None
-    hands_centered      = False
-    victim_supine       = False
-    hands_seen          = False
-    target_color        = CHEST_TARGET_COLOR_OFF
-    hand_feedback       = "Looking for Victim/Hands"
-
-    # --- Pose / chest target ---
+    # --------- Victim detection -----------
     if pose_res.pose_landmarks:
         lms = pose_res.pose_landmarks.landmark
-        victim_supine = is_victim_supine(lms, w, h)
-        ls = get_landmark_coords(lms, mp_pose.PoseLandmark.LEFT_SHOULDER,  w, h)
-        rs = get_landmark_coords(lms, mp_pose.PoseLandmark.RIGHT_SHOULDER, w, h)
-        lh = get_landmark_coords(lms, mp_pose.PoseLandmark.LEFT_HIP,       w, h)
-        rh = get_landmark_coords(lms, mp_pose.PoseLandmark.RIGHT_HIP,      w, h)
-
+        supine_ok = victim_supine(lms, w, h)
+        # chest point (1/3 of way from shoulders to hips)
+        ls, rs = get_xy(lms, mp_pose.PoseLandmark.LEFT_SHOULDER,  w, h), \
+                 get_xy(lms, mp_pose.PoseLandmark.RIGHT_SHOULDER, w, h)
+        lh, rh = get_xy(lms, mp_pose.PoseLandmark.LEFT_HIP,       w, h), \
+                 get_xy(lms, mp_pose.PoseLandmark.RIGHT_HIP,      w, h)
         if None not in (*ls,*rs,*lh,*rh):
             sh_mid  = ((ls[0]+rs[0])//2, (ls[1]+rs[1])//2)
             hip_mid = ((lh[0]+rh[0])//2, (lh[1]+rh[1])//2)
-            cx = int(sh_mid[0]+0.33*(hip_mid[0]-sh_mid[0]))
-            cy = int(sh_mid[1]+0.33*(hip_mid[1]-sh_mid[1]))
-            victim_chest_target = (cx, cy)
-            hand_feedback = "Show Rescuer Hands"
+            victim_center = (int(sh_mid[0] + 0.33*(hip_mid[0]-sh_mid[0])),
+                             int(sh_mid[1] + 0.33*(hip_mid[1]-sh_mid[1])))
+            hand_msg = "Show Rescuer Hands"
         else:
-            hand_feedback = "Show Victim Chest Area"
+            hand_msg = "Show Victim Chest Area"
     else:
-        hand_feedback = "Cannot find Victim"
+        lms = None
+        hand_msg = "Cannot find Victim"
 
-    # --- Hands placement ---
-    if victim_chest_target and victim_supine and hands_res.multi_hand_landmarks:
-        hands_seen = True
-        min_dist = float('inf')
-        for hand in hands_res.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS,
-                                      mp_drawing_styles.get_default_hand_landmarks_style(),
-                                      mp_drawing_styles.get_default_hand_connections_style())
-            for lm in hand.landmark:
-                px, py = int(lm.x*w), int(lm.y*h)
-                d = calculate_distance((px, py), victim_chest_target)
-                if d < min_dist: min_dist, rescuer_hand_center = d, (px, py)
-        if rescuer_hand_center:
-            cv2.circle(frame, rescuer_hand_center, 4, (0,255,255), -1)
-        if min_dist < HAND_PLACEMENT_TOLERANCE:
-            hands_centered = True
-            target_color   = CHEST_TARGET_COLOR_CENTERED
-            hand_feedback  = "Hands Centered"
-        else:
-            hand_feedback  = "Move Hands Closer to Target"
+    # --------- Rescuer hand detection -----------
+    if victim_center and supine_ok and hands_res.multi_hand_landmarks:
+        # exclude hands whose wrist lies on victim wrists (≤40 px)
+        vic_wrists = [get_xy(lms, mp_pose.PoseLandmark.LEFT_WRIST,  w, h),
+                      get_xy(lms, mp_pose.PoseLandmark.RIGHT_WRIST, w, h)] if lms else []
+        best_d = 1e9
+        for h_land in hands_res.multi_hand_landmarks:
+            wrist = h_land.landmark[0]
+            wrist_px = (int(wrist.x*w), int(wrist.y*h))
+            if any(distance(wrist_px, vw) < 40 for vw in vic_wrists if vw[0]):  # skip victim hand
+                continue
+            mp_drawing.draw_landmarks(frame, h_land, mp_hands.HAND_CONNECTIONS,
+                                      mp_styles.get_default_hand_landmarks_style(),
+                                      mp_styles.get_default_hand_connections_style())
+            for lm in h_land.landmark:
+                p = (int(lm.x*w), int(lm.y*h))
+                d = distance(p, victim_center)
+                if d < best_d:
+                    best_d, resc_hand_pt = d, p
+        if resc_hand_pt:
+            cv2.circle(frame, resc_hand_pt, 5, (0,255,255), -1)
+            if best_d < HAND_PLACEMENT_TOLERANCE:
+                hands_centered = True
+                target_col = CHEST_TARGET_COLOR_CENTERED
+                hand_msg   = "Hands Centered"
+            else:
+                hand_msg   = "Move Hands Closer to Target"
 
-    # --- AR guidance (new) ---
-    draw_ar_guidance(frame, victim_chest_target, rescuer_hand_center, hands_centered)
+    # ---------- Posture evaluation ----------
+    if lms and resc_hand_pt:
+        # decide nearer wrist side
+        left_wrist  = get_xy(lms, mp_pose.PoseLandmark.LEFT_WRIST,  w, h)
+        right_wrist = get_xy(lms, mp_pose.PoseLandmark.RIGHT_WRIST, w, h)
+        side_sel = "LEFT" if distance(resc_hand_pt, left_wrist) < \
+                            distance(resc_hand_pt, right_wrist) else "RIGHT"
+        ang = elbow_angle(lms, side_sel, w, h)
+        if ang:
+            posture_ok  = ang >= 160
+            posture_msg = "Posture: Good" if posture_ok else f"Posture: Straighten {side_sel.lower()} arm"
 
-    # --- Compression-rate / cycle logic (unchanged core) ---
-    if hands_centered and rescuer_hand_center:
-        y = rescuer_hand_center[1]
-        if last_rescuer_hand_y is not None:
-            dy = y - last_rescuer_hand_y
+    # ---------- Compression-rate ----------
+    if hands_centered and resc_hand_pt:
+        y = resc_hand_pt[1]
+        if last_hand_y is not None:
+            dy = y - last_hand_y
             if dy > COMPRESSION_THRESHOLD and not is_compressing:
                 is_compressing = True
             elif dy < -COMPRESSION_THRESHOLD and is_compressing:
                 is_compressing = False
                 t = time.time()
                 compression_times.append(t); compression_times = compression_times[-20:]
-                # (cycle & summary logic kept same – omitted for brevity)
+                with open("cpr_log.csv", "a", newline="") as f:
+                    csv.writer(f).writerow([t, int(posture_ok)])
                 if len(compression_times) > 1:
-                    dt = compression_times[-1]-compression_times[0]
-                    current_rate = (len(compression_times)-1)/dt*60 if dt>0.5 else 0
-        last_rescuer_hand_y = y
+                    dt = compression_times[-1] - compression_times[0]
+                    if dt > 0.5:
+                        current_rate = (len(compression_times)-1) / dt * 60
+        last_hand_y = y
     else:
-        last_rescuer_hand_y = None; is_compressing = False
+        last_hand_y = None
+        is_compressing = False
 
-    # --- Draw UI elements (key parts only) --------------
-    if victim_chest_target:
-        cv2.circle(frame, victim_chest_target, CHEST_TARGET_RADIUS, target_color, -1)
-        cv2.circle(frame, victim_chest_target, CHEST_TARGET_RADIUS+5, target_color, 2)
+    # ---------- AR overlays ----------
+    if victim_center and resc_hand_pt and not hands_centered:
+        cv2.arrowedLine(frame, resc_hand_pt, victim_center, AR_ARROW_COLOR, 3, tipLength=.25)
+    draw_labels(frame, victim_center, resc_hand_pt)
 
-    cv2.putText(frame, f"Placement: {hand_feedback}", (10,60),
+    # ---------- UI text ----------
+    if victim_center:
+        cv2.circle(frame, victim_center, CHEST_TARGET_RADIUS, target_col, -1)
+        cv2.circle(frame, victim_center, CHEST_TARGET_RADIUS+5, target_col, 2)
+
+    cv2.putText(frame, f"Placement: {hand_msg}", (10,60),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                 FEEDBACK_COLOR_GOOD if hands_centered else FEEDBACK_COLOR_WARN, 2)
 
-    sup_msg = SUPINE_STATUS_OK_MSG if victim_supine else SUPINE_STATUS_WARN_MSG
-    cv2.putText(frame, sup_msg, (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                FEEDBACK_COLOR_GOOD if victim_supine else FEEDBACK_COLOR_ERR, 2)
+    sup_line = SUPINE_STATUS_OK_MSG if supine_ok else SUPINE_STATUS_WARN_MSG
+    cv2.putText(frame, sup_line, (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                FEEDBACK_COLOR_GOOD if supine_ok else FEEDBACK_COLOR_ERR, 2)
 
-    rate_txt = f"Rate: {current_rate:.0f} /min"
-    cv2.putText(frame, rate_txt, (10,120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, INFO_COLOR, 2)
+    cv2.putText(frame, f"Rate: {current_rate:.0f} /min", (10,120),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, INFO_COLOR, 2)
 
-    cv2.putText(frame, TARGET_DEPTH_MSG, (10,150), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+    cv2.putText(frame, posture_msg, (10,150), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                FEEDBACK_COLOR_GOOD if posture_ok else FEEDBACK_COLOR_WARN, 2)
+
+    cv2.putText(frame, TARGET_DEPTH_MSG, (10,180), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                 FEEDBACK_COLOR_ERR, 2)
 
-    if time.time()-last_metronome_time >= metronome_interval:
-        metronome_on = not metronome_on; last_metronome_time = time.time()
-    cv2.circle(frame, (w-50,50), 20, METRONOME_COLOR_ON if metronome_on else METRONOME_COLOR_OFF, -1)
+    # metronome
+    if time.time() - last_metronome_time >= metronome_interval:
+        metronome_on = not metronome_on
+        last_metronome_time = time.time()
+    cv2.circle(frame, (w-50,50), 20,
+               METRONOME_COLOR_ON if metronome_on else METRONOME_COLOR_OFF, -1)
 
     cv2.putText(frame, "TRAINING AID ONLY", (10,h-15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, WARNING_COLOR, 2)
 
     cv2.imshow("CPR Trainer – Proof of Concept", frame)
-    key = cv2.waitKey(5) & 0xFF
-    if key == ord('q'): break
-    elif key == ord('n'):
-        instruction_step = min(instruction_step+1, len(instructions)-1)
-    elif key == ord('r'):
-        compression_times.clear(); current_rate = 0
-        last_rescuer_hand_y = None; is_compressing = False
-        compressions_remaining = 30; cpr_cycle_active = False
-        cycle_compression_times = []; cycle_hand_drifts = 0
-        last_compression_time   = None
-        show_summary=False; idle_prompt_active=False
+    if cv2.waitKey(5) & 0xFF == ord('q'):
+        break
 
 # ───────────────── Cleanup ─────────────────────────────
 pose.close(); hands.close(); cap.release(); cv2.destroyAllWindows()
