@@ -71,6 +71,8 @@ compression_times = []
 current_rate      = 0
 last_rescuer_hand_y = None
 is_compressing      = False
+compressions_remaining = 30  # Start with 30 compressions per cycle
+cpr_cycle_active     = False # Flag to indicate if we are in a compression cycle
 
 hand_placement_feedback = "Looking for Victim/Hands"
 hands_centered          = False
@@ -184,7 +186,7 @@ while cap.isOpened():
         else:
             hand_placement_feedback = "Move Hands Closer to Target"
 
-    # ─── Compression-rate estimation (unchanged) ────────
+    # ─── Compression-rate estimation ────────────────────
     if hands_centered and rescuer_hand_center:
         y = rescuer_hand_center[1]
         if last_rescuer_hand_y is not None:
@@ -196,6 +198,20 @@ while cap.isOpened():
                 now = time.time()
                 compression_times.append(now)
                 compression_times = compression_times[-20:]
+
+                # Start or continue the cycle and decrement counter
+                if not cpr_cycle_active:
+                    cpr_cycle_active = True
+                if cpr_cycle_active:
+                    compressions_remaining -= 1
+                    if compressions_remaining <= 0:
+                        print("Cycle complete. Resetting compressions.") # Placeholder for breath prompt later
+                        compressions_remaining = 30
+                        # Optionally reset rate calculation here too?
+                        # compression_times.clear()
+                        # current_rate = 0
+                        # cpr_cycle_active = False # Keep active until reset or breath phase
+
                 if len(compression_times) > 1:
                     dt = compression_times[-1] - compression_times[0]
                     current_rate = ((len(compression_times) - 1) / dt * 60
@@ -205,7 +221,7 @@ while cap.isOpened():
         last_rescuer_hand_y = None
         is_compressing      = False
 
-    # ─── Draw UI elements (unchanged) ────────────────────
+    # ─── Draw UI elements ──────────────────────────────
     if victim_chest_target:
         cv2.circle(image, victim_chest_target, CHEST_TARGET_RADIUS, current_target_color, -1)
         cv2.circle(image, victim_chest_target, CHEST_TARGET_RADIUS + 5, current_target_color, 2)
@@ -246,6 +262,12 @@ while cap.isOpened():
     cv2.putText(image, TARGET_DEPTH_MSG, (10, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, FEEDBACK_COLOR_ERR, 2)
 
+    # Display Compression Count during active cycle
+    if cpr_cycle_active:
+        comp_text = f"Compressions Left: {compressions_remaining}"
+        cv2.putText(image, comp_text, (10, 180), # Position below depth message
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, INFO_COLOR, 2)
+
     if time.time() - last_metronome_time >= metronome_interval:
         metronome_on = not metronome_on
         last_metronome_time = time.time()
@@ -269,6 +291,8 @@ while cap.isOpened():
         last_rescuer_hand_y = None
         is_compressing = False
         print("State reset.")
+        compressions_remaining = 30 # Reset compression count
+        cpr_cycle_active     = False # Reset cycle flag
 
 # ───────────────── Cleanup ──────────────────────────────
 pose.close()
