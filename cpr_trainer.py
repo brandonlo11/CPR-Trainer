@@ -332,43 +332,60 @@ while cap.isOpened():
                 1.3, FEEDBACK_COLOR_ERR, 2)
 
     # phase-specific panels
-    status_y_start = 260 # Base Y for status messages
+    # No longer using fixed status_y_start
 
     if pre_count_active:
         cd = int(PRE_START_COUNTDOWN - (now - pre_count_start_time)) + 1
-        # Keep pre-count left-aligned for now, or center if preferred? Let's keep left for consistency.
-        cv2.putText(frame, f"Starting in {cd}", (10, status_y_start),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.5, INFO_COLOR, 2) # Increased size
+        start_text = f"Starting in {cd}"
+        font_scale = 1.5
+        thickness = 2
+        (text_w, text_h), _ = cv2.getTextSize(start_text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)
+        # Center horizontally and vertically
+        text_x = (w - text_w) // 2
+        text_y = (h - text_h) // 2 # Vertical centering
+        cv2.putText(frame, start_text, (text_x, text_y + text_h), # Draw using bottom-left corner
+                    cv2.FONT_HERSHEY_DUPLEX, font_scale, INFO_COLOR, thickness)
 
     elif cycle_active:
-        # Center "Compressions left"
         compressions_text = f"Compressions left: {compressions_left}"
-        (text_w, text_h), _ = cv2.getTextSize(compressions_text, cv2.FONT_HERSHEY_DUPLEX, 1.5, 2)
+        font_scale = 1.5
+        thickness = 2
+        (text_w, text_h), _ = cv2.getTextSize(compressions_text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)
+        # Center horizontally and vertically
         text_x = (w - text_w) // 2
-        cv2.putText(frame, compressions_text, (text_x, status_y_start),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.5, INFO_COLOR, 2) # Increased size
+        text_y = (h - text_h) // 2 # Vertical centering
+        cv2.putText(frame, compressions_text, (text_x, text_y + text_h), # Draw using bottom-left corner
+                    cv2.FONT_HERSHEY_DUPLEX, font_scale, INFO_COLOR, thickness)
 
     elif breath_phase_active:
-        # Center first line of breath instructions, left-align others
-        y_base = status_y_start
-        line_height = 40 # Increased line height slightly
+        font_scale = 1.3
+        thickness = 2
+        line_height = 40
+        # Calculate total height of the breath instruction block
+        total_block_height = len(breath_msg_lines) * line_height
+        # Calculate starting Y to center the block vertically
+        y_block_start = (h - total_block_height) // 2
+
         for i, line in enumerate(breath_msg_lines):
-            font_scale = 1.3 # Increased size
+            current_y = y_block_start + i * line_height + line_height # Use bottom-left for putText
             if i == 0: # Center the main "GIVE 2 BREATHS" title
-                (text_w, text_h), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_DUPLEX, font_scale, 2)
+                (text_w, text_h), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)
                 text_x = (w - text_w) // 2
             else: # Keep subsequent lines left-aligned
                 text_x = 10
-            cv2.putText(frame, line, (text_x, y_base + i * line_height), cv2.FONT_HERSHEY_DUPLEX,
-                        font_scale, INFO_COLOR, 2)
+            cv2.putText(frame, line, (text_x, current_y), cv2.FONT_HERSHEY_DUPLEX,
+                        font_scale, INFO_COLOR, thickness)
 
     elif set_counter >= SET_TARGET:
-        # Center "4 sets complete" message
         complete_text = "4 sets complete – training cycle finished"
-        (text_w, text_h), _ = cv2.getTextSize(complete_text, cv2.FONT_HERSHEY_DUPLEX, 1.5, 2)
+        font_scale = 1.5
+        thickness = 2
+        (text_w, text_h), _ = cv2.getTextSize(complete_text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)
+        # Center horizontally and vertically
         text_x = (w - text_w) // 2
-        cv2.putText(frame, complete_text, (text_x, status_y_start),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.5, INFO_COLOR, 2) # Increased size
+        text_y = (h - text_h) // 2 # Vertical centering
+        cv2.putText(frame, complete_text, (text_x, text_y + text_h), # Draw using bottom-left corner
+                    cv2.FONT_HERSHEY_DUPLEX, font_scale, INFO_COLOR, thickness)
 
     # metronome circle
     metro_col = METRONOME_COLOR_BEAT if metronome_flash else METRONOME_COLOR_IDLE
