@@ -332,24 +332,43 @@ while cap.isOpened():
                 1.3, FEEDBACK_COLOR_ERR, 2)
 
     # phase-specific panels
+    status_y_start = 260 # Base Y for status messages
+
     if pre_count_active:
         cd = int(PRE_START_COUNTDOWN - (now - pre_count_start_time)) + 1
-        cv2.putText(frame, f"Starting in {cd}", (10,260),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.3, INFO_COLOR, 2)
+        # Keep pre-count left-aligned for now, or center if preferred? Let's keep left for consistency.
+        cv2.putText(frame, f"Starting in {cd}", (10, status_y_start),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.5, INFO_COLOR, 2) # Increased size
 
     elif cycle_active:
-        cv2.putText(frame, f"Compressions left: {compressions_left}", (10,260),
-                    cv2.FONT_HERSHEY_DUPLEX, 1.3, INFO_COLOR, 2)
+        # Center "Compressions left"
+        compressions_text = f"Compressions left: {compressions_left}"
+        (text_w, text_h), _ = cv2.getTextSize(compressions_text, cv2.FONT_HERSHEY_DUPLEX, 1.5, 2)
+        text_x = (w - text_w) // 2
+        cv2.putText(frame, compressions_text, (text_x, status_y_start),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.5, INFO_COLOR, 2) # Increased size
 
     elif breath_phase_active:
-        y_base = 260
+        # Center first line of breath instructions, left-align others
+        y_base = status_y_start
+        line_height = 40 # Increased line height slightly
         for i, line in enumerate(breath_msg_lines):
-            cv2.putText(frame, line, (10, y_base + i*35), cv2.FONT_HERSHEY_DUPLEX,
-                        1.1, INFO_COLOR, 2)
+            font_scale = 1.3 # Increased size
+            if i == 0: # Center the main "GIVE 2 BREATHS" title
+                (text_w, text_h), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_DUPLEX, font_scale, 2)
+                text_x = (w - text_w) // 2
+            else: # Keep subsequent lines left-aligned
+                text_x = 10
+            cv2.putText(frame, line, (text_x, y_base + i * line_height), cv2.FONT_HERSHEY_DUPLEX,
+                        font_scale, INFO_COLOR, 2)
 
     elif set_counter >= SET_TARGET:
-        cv2.putText(frame, "4 sets complete – training cycle finished",
-                    (10,260), cv2.FONT_HERSHEY_DUPLEX, 1.3, INFO_COLOR, 2)
+        # Center "4 sets complete" message
+        complete_text = "4 sets complete – training cycle finished"
+        (text_w, text_h), _ = cv2.getTextSize(complete_text, cv2.FONT_HERSHEY_DUPLEX, 1.5, 2)
+        text_x = (w - text_w) // 2
+        cv2.putText(frame, complete_text, (text_x, status_y_start),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.5, INFO_COLOR, 2) # Increased size
 
     # metronome circle
     metro_col = METRONOME_COLOR_BEAT if metronome_flash else METRONOME_COLOR_IDLE
@@ -365,7 +384,7 @@ while cap.isOpened():
 
     draw_labels(frame, victim_pt, resc_hand)
 
-    cv2.imshow("CPR Trainer – Proof of Concept", frame)
+    cv2.imshow("CPR Trainer", frame)
     if cv2.waitKey(5) & 0xFF == ord('q'):
         break
 
