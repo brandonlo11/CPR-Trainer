@@ -36,7 +36,7 @@ HAND_PLACEMENT_TOLERANCE = 45             # px
 COMPRESSION_THRESHOLD    = 8              # Δ-y per compression
 
 # supine text
-SUPINE_STATUS_OK_MSG   = "Victim supine ✓"
+SUPINE_STATUS_OK_MSG   = "Victim supine"
 SUPINE_STATUS_WARN_MSG = "Victim NOT lying flat!"
 
 # ──────────────────────── MediaPipe ───────────────────────
